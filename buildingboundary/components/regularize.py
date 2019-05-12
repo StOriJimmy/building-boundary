@@ -4,18 +4,18 @@
 @author: Chris Lucas
 """
 
-import sys
 import math
 
 import numpy as np
+from shapely.geometry import Polygon, MultiPolygon
 
-from ..utils.angle import (min_angle_difference, weighted_angle_mean,
-                           to_positive_angle, perpendicular)
+from ..utils.angle import min_angle_difference, perpendicular
 from ..utils.error import ThresholdError
-from .segmentation import merge_segments
+from ..utils import create_segments, distance
+from .merge import merge_segments
 
 
-def get_primary_segments(segments, num_points=sys.maxsize):
+def get_primary_segments(segments, num_points):
     """
     Checks the segments and returns the segments which are supported
     by at least the given number of points.
@@ -34,7 +34,7 @@ def get_primary_segments(segments, num_points=sys.maxsize):
         The segments which are supported by at least the given number of
         points.
     """
-    primary_segments = [s for s in segments if len(s.points) > num_points]
+    primary_segments = [s for s in segments if len(s.points) >= num_points]
     return primary_segments
 
 
@@ -54,7 +54,7 @@ def find_main_orientation(segments):
         The orientation of the segment supported by the most points.
         In radians.
     """
-    longest_segment = np.argmin([s.length for s in segments])
+    longest_segment = np.argmax([len(s.points) for s in segments])
     main_orientation = segments[longest_segment].orientation
     return main_orientation
 
@@ -75,7 +75,7 @@ def sort_orientations(orientations):
 
     """
     unsorted_orientations = [o['orientation'] for o in orientations]
-    lengths = [o['length'] for o in orientations]
+    lengths = [o['size'] for o in orientations]
     sort = np.argsort(lengths)
     sorted_orientations = np.array(unsorted_orientations)[sort].tolist()
     return sorted_orientations
@@ -107,17 +107,13 @@ def compute_primary_orientations(primary_segments, angle_epsilon=0.1):
             a2 = o['orientation']
             angle_diff = min_angle_difference(a1, a2)
             if angle_diff < angle_epsilon:
-                sum_length = s.length + o['length']
-                mean = weighted_angle_mean([to_positive_angle(a1),
-                                            to_positive_angle(a2)],
-                                           [s.length/sum_length,
-                                            o['length']/sum_length])
-                o['length'] += s.length
-                o['orientation'] = mean
+                if len(s.points) > o['size']:
+                    o['size'] = len(s.points)
+                    o['orientation'] = a1
                 break
         else:
             orientations.append({'orientation': a1,
-                                 'length': s.length})
+                                 'size': len(s.points)})
 
     primary_orientations = sort_orientations(orientations)
 
@@ -186,7 +182,7 @@ def add_perpendicular(primary_orientations, angle_epsilon=0.1):
     return primary_orientations
 
 
-def get_primary_orientations(segments, num_points=sys.maxsize,
+def get_primary_orientations(segments, num_points=None,
                              angle_epsilon=0.1):
     """
     Computes the primary orientations of the building by checking the
@@ -211,7 +207,10 @@ def get_primary_orientations(segments, num_points=sys.maxsize,
     primary_orientations : list of float
         The computed primary orientations in radians.
     """
-    primary_segments = get_primary_segments(segments, num_points=num_points)
+    if num_points is not None:
+        primary_segments = get_primary_segments(segments, num_points)
+    else:
+        primary_segments = []
 
     if len(primary_segments) > 0:
         primary_orientations = compute_primary_orientations(primary_segments,
@@ -257,7 +256,8 @@ def regularize_segments(segments, primary_orientations, max_error=None):
 
 
 def regularize_and_merge(segments, primary_orientations,
-                         merge_angle, max_error=None):
+                         merge_angle, max_error=None,
+                         max_merge_distance=None):
     """
     Keeps regularizing and merging the segments until no changes
     happen.
@@ -291,10 +291,13 @@ def regularize_and_merge(segments, primary_orientations,
     while num_segments != prev_num_segments:
         prev_num_segments = len(segments)
 
-        segments = regularize_segments(segments, primary_orientations,
+        segments = regularize_segments(segments,
+                                       primary_orientations,
                                        max_error=max_error)
 
-        segments, merge_history_part = merge_segments(segments, merge_angle)
+        segments, merge_history_part = merge_segments(segments,
+                                                      merge_angle,
+                                                      max_merge_distance)
         merge_history.extend(merge_history_part)
 
         num_segments = len(segments)
@@ -303,3 +306,21 @@ def regularize_and_merge(segments, primary_orientations,
                                    max_error=max_error)
 
     return segments, merge_history
+
+
+def polygon_orientations(polygon):
+    for s in create_segments(polygon.exterior.coords[:-1]):
+        dx, dy = s[0] - s[1]
+        dist = distance(s[0], s[1])
+        if dist > 1:
+            yield math.atan2(dy, dx)
+
+
+def footprint_orientations(geom):
+    orientations = []
+    if type(geom) == Polygon:
+        orientations = list(polygon_orientations(geom))
+    elif type(geom) == MultiPolygon:
+        for p in geom:
+            orientations.extend(list(polygon_orientations(p)))
+    return orientations
